@@ -2,10 +2,10 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { PhotoAnalysis, NutritionData } from "../types";
 
-const API_KEY = process.env.API_KEY || '';
-
-// Global quota state as per STRICT MODE
+// Quota and Queue State
 let isGlobalQuotaExhausted = false;
+let requestQueue: (() => Promise<any>)[] = [];
+let activeRequests = 0;
 
 export const setQuotaExhausted = (state: boolean) => {
   isGlobalQuotaExhausted = state;
@@ -14,7 +14,14 @@ export const setQuotaExhausted = (state: boolean) => {
 export const getQuotaStatus = () => isGlobalQuotaExhausted;
 
 export const getGeminiClient = () => {
-  return new GoogleGenAI({ apiKey: API_KEY });
+  return new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+};
+
+const shouldUpgradeToPro = async () => {
+  if (window.aistudio) {
+    return await window.aistudio.hasSelectedApiKey();
+  }
+  return false;
 };
 
 export const isQuotaError = (error: any): boolean => {
@@ -24,13 +31,56 @@ export const isQuotaError = (error: any): boolean => {
     strMsg.includes('429') || 
     strMsg.includes('quota') || 
     strMsg.includes('resource_exhausted') || 
-    strMsg.includes('limit reached') ||
-    strMsg.includes('exhausted')
+    strMsg.includes('limit reached')
   );
   if (hit) isGlobalQuotaExhausted = true;
   return hit;
 };
 
+/**
+ * AI QUEUE MANAGER (V3 Parallel)
+ * For Paid keys, we process up to 3 requests simultaneously.
+ */
+export const enqueueRequest = <T>(requestFn: () => Promise<T>): Promise<T> => {
+  return new Promise((resolve, reject) => {
+    requestQueue.push(async () => {
+      try {
+        const result = await requestFn();
+        resolve(result);
+      } catch (err) {
+        reject(err);
+      }
+    });
+    processQueue();
+  });
+};
+
+const processQueue = async () => {
+  if (requestQueue.length === 0) return;
+
+  const isPaid = await shouldUpgradeToPro();
+  const maxConcurrency = isPaid ? 3 : 1;
+  const delayBetweenStarts = isPaid ? 200 : 3000;
+
+  while (activeRequests < maxConcurrency && requestQueue.length > 0) {
+    const task = requestQueue.shift();
+    if (task) {
+      activeRequests++;
+      task().finally(() => {
+        activeRequests--;
+        processQueue();
+      });
+      
+      if (requestQueue.length > 0 && isPaid) {
+        await new Promise(r => setTimeout(r, delayBetweenStarts));
+      }
+    }
+  }
+};
+
+/**
+ * Nutrition estimation
+ */
 export const estimateRecipeNutrition = async (title: string, ingredients: string[]): Promise<NutritionData> => {
   if (isGlobalQuotaExhausted) throw new Error("QUOTA_EXHAUSTED");
 
@@ -55,29 +105,43 @@ export const estimateRecipeNutrition = async (title: string, ingredients: string
         }
       }
     });
-    return JSON.parse(response.text);
+    return JSON.parse(response.text || "{}");
   } catch (error) {
     if (isQuotaError(error)) throw error;
-    console.error("Nutrition estimation failed", error);
     return { kcal: 0, protein: 0, carbs: 0, fat: 0 };
   }
 };
 
+/**
+ * Image generation - ULTRA REALISTIC CONFIG
+ */
 export const generateRecipeImage = async (title: string): Promise<string> => {
-  if (isGlobalQuotaExhausted) {
-    throw new Error("QUOTA_EXHAUSTED");
-  }
+  if (isGlobalQuotaExhausted) throw new Error("QUOTA_EXHAUSTED");
 
   const ai = getGeminiClient();
-  // STRICT MODE: Image Content Rules (Food Only)
-  const prompt = `Professional food photography of ${title}. Close-up, cinematic lighting, minimalist background, 8k resolution. SINGLE PREPARED DISH ONLY. No people, no hands, no faces, no text, no logos, no landscapes, no animals. Just the finished food on a plate or in a bowl. Highly appetizing, premium quality.`;
+  const isPaid = await shouldUpgradeToPro();
+  
+  const modelToUse = isPaid ? 'gemini-3-pro-image-preview' : 'gemini-2.5-flash-image';
+  
+  // Advanced Prompt for High-End Realism
+  const prompt = `A hyper-realistic, high-fidelity professional food photograph of "${title}". 
+    The dish is elegantly plated on artisan ceramic dinnerware. 
+    Authentic food textures (steam, moisture, crispy edges), natural soft daylight from a side window, 
+    shallow depth of field with a beautiful blurred background (bokeh). 
+    Gourmet styling, macro details, vibrant but natural colors. 
+    8k resolution, ultra-sharp focus. NO text, NO watermarks, NO artificial filters. 
+    Realistic, appetizing, and sophisticated.`;
   
   try {
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash-image',
+      model: modelToUse, 
       contents: { parts: [{ text: prompt }] },
       config: {
-        imageConfig: { aspectRatio: "1:1" }
+        imageConfig: { 
+          aspectRatio: "1:1",
+          // Use 1K for perfect mobile UI balance, or upgrade to 2K for extreme detail if needed
+          imageSize: isPaid ? "1K" : "1K" 
+        }
       }
     });
     
@@ -85,26 +149,23 @@ export const generateRecipeImage = async (title: string): Promise<string> => {
     if (part?.inlineData) {
       return `data:image/png;base64,${part.inlineData.data}`;
     }
-    throw new Error("No image data in response");
+    throw new Error("No image data");
   } catch (error) {
-    if (isQuotaError(error)) {
-      isGlobalQuotaExhausted = true;
-      throw error;
-    }
-    console.error("Image generation failed", error);
-    return ""; 
+    if (isQuotaError(error)) throw error;
+    throw error;
   }
 };
 
+/**
+ * Photo Analysis
+ */
 export const analyzeMealImage = async (base64Data: string): Promise<PhotoAnalysis> => {
-  if (isGlobalQuotaExhausted) throw new Error("QUOTA_EXHAUSTED");
-
   const ai = getGeminiClient();
-  const prompt = `Analyze this meal photo and provide details in Ukrainian. Format as JSON. Be precise about calories and macronutrients based on the visual portion size.`;
+  const prompt = `Analyze this meal photo and provide details in Ukrainian. Format as JSON. Be precise about calories and portions.`;
   
   try {
     const response = await ai.models.generateContent({
-      model: 'gemini-3-pro-preview', // Upgraded for complex visual analysis
+      model: 'gemini-3-pro-preview', 
       contents: {
         parts: [
           { inlineData: { data: base64Data, mimeType: 'image/jpeg' } },
@@ -112,6 +173,7 @@ export const analyzeMealImage = async (base64Data: string): Promise<PhotoAnalysi
         ]
       },
       config: {
+        thinkingConfig: { thinkingBudget: 16384 },
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
@@ -131,7 +193,7 @@ export const analyzeMealImage = async (base64Data: string): Promise<PhotoAnalysi
         }
       }
     });
-    return JSON.parse(response.text);
+    return JSON.parse(response.text || "{}");
   } catch (error) {
     if (isQuotaError(error)) throw error;
     throw error;
